@@ -40,23 +40,15 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Setup Python and tools
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v4
       with:
-        python-version: '3.12'
-        cache: 'pip'
+        python-version: '3.x'
       
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y woff2 fontforge
-        pip install fonttools brotli requests
-        
-    - name: Verify tools installation
-      run: |
-        echo "Checking installed tools..."
-        which woff2_compress && woff2_compress -h >/dev/null 2>&1 && echo "✓ woff2_compress installed" || echo "⚠ woff2_compress may not work properly"
-        python -c "import fontTools; print(f'✓ fonttools: {fontTools.__version__}')"
-        python -c "import brotli; print(f'✓ brotli: {brotli.__version__}')"
+        sudo apt-get install -y woff2
+        pip install fonttools requests
 
     - name: Create output directory
       run: mkdir -p $OUTPUT_DIR
@@ -66,36 +58,35 @@ jobs:
       id: download-font
       run: |
         FONT_URL="${{ github.event.inputs.font_url }}"
-        FILENAME=$(basename "$FONT_URL" | sed 's/?.*$//')
+        FILENAME=$(basename "$FONT_URL" | sed 's/?.*$//')  # Remove URL parameters
         echo "Downloading font from: $FONT_URL"
         
-        if curl -L -f -o "$OUTPUT_DIR/downloaded_font" "$FONT_URL"; then
-          FILE_TYPE=$(file -b --mime-type "$OUTPUT_DIR/downloaded_font" 2>/dev/null || echo "unknown")
-          echo "MIME type detected: $FILE_TYPE"
+        # Download font file
+        curl -L -o "$OUTPUT_DIR/downloaded_font" "$FONT_URL"
+        
+        # Detect file type and rename appropriately
+        if [ -f "$OUTPUT_DIR/downloaded_font" ]; then
+          # Check file type using file command
+          FILE_TYPE=$(file -b "$OUTPUT_DIR/downloaded_font")
+          echo "File type detected: $FILE_TYPE"
           
-          case "$FILE_TYPE" in
-            *opentype*|*sfnt*|*otf*)
-              EXTENSION="otf"
-              ;;
-            *truetype*|*ttf*)
-              EXTENSION="ttf"
-              ;;
-            *woff2*)
-              EXTENSION="woff2"
-              ;;
-            *woff*)
-              EXTENSION="woff"
-              ;;
-            *)
-              # Try to get extension from filename
-              EXTENSION="${FILENAME##*.}"
-              if [ -z "$EXTENSION" ] || [ "$EXTENSION" = "$FILENAME" ]; then
-                EXTENSION="otf"
-              fi
-              ;;
-          esac
+          if echo "$FILE_TYPE" | grep -q "OpenType"; then
+            EXTENSION="otf"
+          elif echo "$FILE_TYPE" | grep -q "TrueType"; then
+            EXTENSION="ttf"
+          elif echo "$FILE_TYPE" | grep -q "WOFF"; then
+            EXTENSION="woff"
+          elif echo "$FILE_TYPE" | grep -q "WOFF2"; then
+            EXTENSION="woff2"
+          else
+            # Fallback to original extension
+            EXTENSION="${FILENAME##*.}"
+            if [ -z "$EXTENSION" ] || [ "$EXTENSION" = "$FILENAME" ]; then
+              EXTENSION="otf"  # Default to OTF for unknown types
+            fi
+          fi
           
-          FONT_NAME=$(basename "$FILENAME" | sed 's/\.[^.]*$//')
+          FONT_NAME=$(basename "$FILENAME" ."$EXTENSION")
           if [ -z "$FONT_NAME" ] || [ "$FONT_NAME" = "$FILENAME" ]; then
             FONT_NAME="imported_font"
           fi
@@ -104,373 +95,268 @@ jobs:
           echo "downloaded_font_path=$OUTPUT_DIR/${FONT_NAME}.${EXTENSION}" >> $GITHUB_OUTPUT
           echo "font_name=$FONT_NAME" >> $GITHUB_OUTPUT
           echo "original_extension=$EXTENSION" >> $GITHUB_OUTPUT
-          echo "✓ Downloaded as: $FONT_NAME.$EXTENSION"
-        else
-          echo "✗ Failed to download font from URL"
-          exit 1
+          echo "Downloaded as: $FONT_NAME.$EXTENSION"
         fi
 
     - name: Find local font files
       if: github.event.inputs.font_url == '' || github.event.inputs.font_path != 'fonts/input/'
       id: find-local-fonts
       run: |
-        SEARCH_PATH="${{ github.event.inputs.font_path }}"
-        if [ -z "$SEARCH_PATH" ] || [ "$SEARCH_PATH" = "fonts/input/" ]; then
+        if [ "${{ github.event.inputs.font_path }}" != "" ] && [ "${{ github.event.inputs.font_path }}" != "fonts/input/" ]; then
+          SEARCH_PATH="${{ github.event.inputs.font_path }}"
+        else
           SEARCH_PATH="fonts/"
         fi
         
-        echo "Searching for fonts in: $SEARCH_PATH"
-        
-        if [ -f "$SEARCH_PATH" ]; then
-          echo "$SEARCH_PATH" > font_list.txt
-        elif [ -d "$SEARCH_PATH" ]; then
-          find "$SEARCH_PATH" -type f \( -iname "*.ttf" -o -iname "*.otf" -o -iname "*.woff" -o -iname "*.woff2" \) ! -path "*/$OUTPUT_DIR/*" > font_list.txt
-        else
-          echo "Warning: Path '$SEARCH_PATH' not found"
-          touch font_list.txt
-        fi
-        
-        FONT_COUNT=$(wc -l < font_list.txt 2>/dev/null | tr -d ' ' || echo "0")
-        echo "font_count=$FONT_COUNT" >> $GITHUB_OUTPUT
-        
-        if [ "$FONT_COUNT" -gt 0 ]; then
-          echo "Found $FONT_COUNT font file(s):"
+        if [ -d "$SEARCH_PATH" ] || [ -f "$SEARCH_PATH" ]; then
+          if [ -f "$SEARCH_PATH" ]; then
+            # Single file
+            echo "$SEARCH_PATH" > font_list.txt
+          else
+            # Directory - include OTF files in search
+            find "$SEARCH_PATH" \( -name "*.ttf" -o -name "*.otf" -o -name "*.woff" -o -name "*.woff2" \) ! -path "*/$OUTPUT_DIR/*" > font_list.txt
+          fi
+          
+          FONT_COUNT=$(wc -l < font_list.txt | tr -d ' ')
+          echo "font_count=$FONT_COUNT" >> $GITHUB_OUTPUT
+          echo "Found $FONT_COUNT font files"
+          echo "Font files:"
           cat font_list.txt
         else
+          echo "font_count=0" >> $GITHUB_OUTPUT
           echo "No font files found in $SEARCH_PATH"
         fi
 
     - name: Convert fonts with OTF support
       id: convert-fonts
       run: |
-        python << 'PYTHON_SCRIPT'
-        import os
-        import json
-        import subprocess
-        import shutil
-        from pathlib import Path
-        from datetime import datetime
+        # Create fonts array for processing
+        FONT_FILES=()
         
-        OUTPUT_DIR = os.environ['OUTPUT_DIR']
-        output_formats = "${{ github.event.inputs.output_formats }}"
+        # Add downloaded font if available
+        if [ -f "${{ steps.download-font.outputs.downloaded_font_path }}" ]; then
+          FONT_FILES+=("${{ steps.download-font.outputs.downloaded_font_path }}")
+          echo "Processing downloaded font: ${{ steps.download-font.outputs.downloaded_font_path }}"
+        fi
         
-        # Collect font files
-        font_files = []
+        # Add local fonts
+        if [ -f font_list.txt ] && [ -s font_list.txt ]; then
+          while IFS= read -r font_file; do
+            if [ -f "$font_file" ]; then
+              FONT_FILES+=("$font_file")
+            fi
+          done < font_list.txt
+        fi
         
-        downloaded_font = "${{ steps.download-font.outputs.downloaded_font_path }}"
-        if downloaded_font and Path(downloaded_font).exists():
-            font_files.append(downloaded_font)
-            print(f"Added downloaded font: {downloaded_font}")
+        if [ ${#FONT_FILES[@]} -eq 0 ]; then
+          echo "No font files found to convert"
+          exit 0
+        fi
         
-        if Path("font_list.txt").exists():
-            with open("font_list.txt", "r") as f:
-                for line in f:
-                    font_path = line.strip()
-                    if font_path and Path(font_path).exists():
-                        font_files.append(font_path)
+        echo "Processing ${#FONT_FILES[@]} font files"
         
-        if not font_files:
-            print("No font files to convert")
-            exit(0)
+        # Create metadata file
+        cat << EOF > $OUTPUT_DIR/metadata.json
+        {
+          "conversion_date": "$(date -Iseconds)",
+          "repository": "${{ github.repository }}",
+          "run_id": "${{ github.run_id }}",
+          "output_formats": "${{ github.event.inputs.output_formats }}",
+          "fonts": [
+        EOF
         
-        print(f"\nProcessing {len(font_files)} font file(s)\n")
-        
-        # Initialize metadata
-        metadata = {
-            "conversion_date": datetime.now().isoformat(),
-            "repository": "${{ github.repository }}",
-            "run_id": "${{ github.run_id }}",
-            "output_formats": output_formats,
-            "fonts": []
-        }
-        
-        conversion_stats = {"success": 0, "failed": 0, "formats": {}}
-        
-        for font_path in font_files:
-            font_path_obj = Path(font_path)
-            font_name = font_path_obj.stem
-            original_ext = font_path_obj.suffix[1:].lower() if font_path_obj.suffix else "unknown"
+        FIRST_FONT=true
+        for font_path in "${FONT_FILES[@]}"; do
+          if [ -f "$font_path" ]; then
+            FONT_NAME=$(basename "$font_path" | cut -f 1 -d '.')
+            ORIGINAL_EXT="${font_path##*.}"
             
-            print(f"Converting: {font_name} (.{original_ext})")
+            echo "Converting: $FONT_NAME (.$ORIGINAL_EXT)"
             
-            font_info = {
-                "name": font_name,
-                "original_file": font_path_obj.name,
-                "original_format": original_ext,
-                "converted_formats": [],
-                "css_file": f"{font_name}.css"
+            # Add to metadata
+            if [ "$FIRST_FONT" = false ]; then
+              echo "," >> $OUTPUT_DIR/metadata.json
+            fi
+            
+            cat << EOF >> $OUTPUT_DIR/metadata.json
+            {
+              "name": "$FONT_NAME",
+              "original_file": "$(basename "$font_path")",
+              "original_format": "$ORIGINAL_EXT",
+              "converted_formats": [],
+              "css_file": "$FONT_NAME.css"
             }
+EOF
+            FIRST_FONT=false
             
-            converted_formats = []
-            css_sources = []
-            
-            try:
-                # WOFF2 conversion
-                if "woff2" in output_formats or output_formats == "all":
-                    woff2_path = Path(OUTPUT_DIR) / f"{font_name}.woff2"
-                    result = subprocess.run(
-                        ["woff2_compress", str(font_path)],
-                        capture_output=True,
-                        text=True
-                    )
-                    
-                    temp_woff2 = Path(f"{font_name}.woff2")
-                    if result.returncode == 0 and temp_woff2.exists():
-                        shutil.move(str(temp_woff2), str(woff2_path))
-                        converted_formats.append("woff2")
-                        css_sources.append(f"url('./{font_name}.woff2') format('woff2')")
-                        print(f"  ✓ WOFF2 created")
-                    else:
-                        print(f"  ⚠ WOFF2 conversion failed: {result.stderr}")
-                
-                # WOFF conversion
-                if "woff" in output_formats or output_formats == "all":
-                    woff_path = Path(OUTPUT_DIR) / f"{font_name}.woff"
-                    # Try using fonttools first
-                    result = subprocess.run(
-                        ["python", "-m", "fontTools.ttLib", "woff", str(font_path), "--output", str(woff_path)],
-                        capture_output=True,
-                        text=True
-                    )
-                    
-                    if result.returncode != 0 or not woff_path.exists():
-                        # Fallback to pyftconvert if available
-                        result = subprocess.run(
-                            ["pyftconvert", str(font_path), "--flavor=woff", f"--output={woff_path}"],
-                            capture_output=True,
-                            text=True
-                        )
-                    
-                    if woff_path.exists():
-                        converted_formats.append("woff")
-                        css_sources.append(f"url('./{font_name}.woff') format('woff')")
-                        print(f"  ✓ WOFF created")
-                    else:
-                        print(f"  ⚠ WOFF conversion failed: {result.stderr}")
-                
-                # TTF handling
-                if "ttf" in output_formats or output_formats == "all":
-                    ttf_path = Path(OUTPUT_DIR) / f"{font_name}.ttf"
-                    
-                    if original_ext == "ttf":
-                        # Copy original TTF
-                        shutil.copy2(font_path, ttf_path)
-                        converted_formats.append("ttf")
-                        css_sources.append(f"url('./{font_name}.ttf') format('truetype')")
-                        print(f"  ✓ TTF copied")
-                    elif original_ext == "otf":
-                        # Convert OTF to TTF
-                        result = subprocess.run(
-                            ["python", "-m", "fontTools.ttLib", str(font_path), "--output", str(ttf_path)],
-                            capture_output=True,
-                            text=True
-                        )
-                        if result.returncode != 0 or not ttf_path.exists():
-                            # Fallback
-                            result = subprocess.run(
-                                ["pyftconvert", str(font_path), "--flavor=ttf", f"--output={ttf_path}"],
-                                capture_output=True,
-                                text=True
-                            )
-                        
-                        if ttf_path.exists():
-                            converted_formats.append("ttf")
-                            css_sources.append(f"url('./{font_name}.ttf') format('truetype')")
-                            print(f"  ✓ TTF converted from OTF")
-                        else:
-                            print(f"  ⚠ TTF conversion failed: {result.stderr}")
-                    else:
-                        # Convert other formats to TTF
-                        result = subprocess.run(
-                            ["python", "-m", "fontTools.ttLib", str(font_path), "--output", str(ttf_path)],
-                            capture_output=True,
-                            text=True
-                        )
-                        if ttf_path.exists():
-                            converted_formats.append("ttf")
-                            css_sources.append(f"url('./{font_name}.ttf') format('truetype')")
-                            print(f"  ✓ TTF created")
-                        else:
-                            print(f"  ⚠ TTF conversion failed: {result.stderr}")
-                
-                # Keep original OTF
-                if original_ext == "otf" and (output_formats == "all" or "otf" in output_formats):
-                    otf_path = Path(OUTPUT_DIR) / f"{font_name}.otf"
-                    shutil.copy2(font_path, otf_path)
-                    converted_formats.append("otf")
-                    css_sources.append(f"url('./{font_name}.otf') format('opentype')")
-                    print(f"  ✓ OTF copied")
-                
-                # Generate CSS
-                if css_sources:
-                    css_content = f"""/* Font: {font_name} */
-/* Original: {font_path_obj.name} */
-/* Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} */
-
-@font-face {{
-  font-family: '{font_name}';
+            # Initialize CSS file
+            cat << EOF > "$OUTPUT_DIR/${FONT_NAME}.css"
+/* Font generated by GitHub Actions */
+/* Original: $FONT_NAME.$ORIGINAL_EXT */
+@font-face {
+  font-family: '$FONT_NAME';
   font-style: normal;
   font-weight: 400;
   font-display: swap;
-  src: {',\n       '.join(css_sources)};
-}}
+  src: 
+EOF
+            
+            CONVERTED_FORMATS=()
+            
+            # Convert to WOFF2 (from any format)
+            if [[ "${{ github.event.inputs.output_formats }}" =~ "woff2" ]] || [[ "${{ github.event.inputs.output_formats }}" == "all" ]]; then
+              echo "Converting to WOFF2..."
+              if woff2_compress "$font_path" 2>/dev/null; then
+                if [ -f "${FONT_NAME}.woff2" ]; then
+                  mv "${FONT_NAME}.woff2" "$OUTPUT_DIR/"
+                  CONVERTED_FORMATS+=("woff2")
+                  echo "    url('./${FONT_NAME}.woff2') format('woff2')," >> "$OUTPUT_DIR/${FONT_NAME}.css"
+                fi
+              else
+                echo "WOFF2 conversion failed for $FONT_NAME"
+              fi
+            fi
+            
+            # Convert to WOFF (from any format)
+            if [[ "${{ github.event.inputs.output_formats }}" =~ "woff" ]] || [[ "${{ github.event.inputs.output_formats }}" == "all" ]]; then
+              echo "Converting to WOFF..."
+              if pyftconvert "$font_path" --flavor=woff --output="$OUTPUT_DIR/${FONT_NAME}.woff" 2>/dev/null; then
+                CONVERTED_FORMATS+=("woff")
+                echo "    url('./${FONT_NAME}.woff') format('woff')," >> "$OUTPUT_DIR/${FONT_NAME}.css"
+              else
+                echo "WOFF conversion failed for $FONT_NAME"
+              fi
+            fi
+            
+            # Handle TTF conversion
+            if [[ "${{ github.event.inputs.output_formats }}" =~ "ttf" ]] || [[ "${{ github.event.inputs.output_formats }}" == "all" ]]; then
+              if [[ "$ORIGINAL_EXT" == "otf" ]]; then
+                echo "Converting OTF to TTF..."
+                if pyftconvert "$font_path" --flavor=ttf --output="$OUTPUT_DIR/${FONT_NAME}.ttf" 2>/dev/null; then
+                  CONVERTED_FORMATS+=("ttf")
+                  echo "    url('./${FONT_NAME}.ttf') format('truetype');" >> "$OUTPUT_DIR/${FONT_NAME}.css"
+                else
+                  echo "OTF to TTF conversion failed for $FONT_NAME"
+                fi
+              elif [[ "$ORIGINAL_EXT" == "ttf" ]]; then
+                echo "Copying TTF..."
+                cp "$font_path" "$OUTPUT_DIR/${FONT_NAME}.ttf"
+                CONVERTED_FORMATS+=("ttf")
+                echo "    url('./${FONT_NAME}.ttf') format('truetype');" >> "$OUTPUT_DIR/${FONT_NAME}.css"
+              else
+                # For other formats, try to convert to TTF
+                echo "Converting to TTF..."
+                if pyftconvert "$font_path" --flavor=ttf --output="$OUTPUT_DIR/${FONT_NAME}.ttf" 2>/dev/null; then
+                  CONVERTED_FORMATS+=("ttf")
+                  echo "    url('./${FONT_NAME}.ttf') format('truetype');" >> "$OUTPUT_DIR/${FONT_NAME}.css"
+                fi
+              fi
+            fi
+            
+            # Also keep original OTF file if input was OTF
+            if [[ "$ORIGINAL_EXT" == "otf" ]] && [[ "${{ github.event.inputs.output_formats }}" == "all" ]]; then
+              echo "Keeping original OTF file..."
+              cp "$font_path" "$OUTPUT_DIR/${FONT_NAME}.otf"
+              CONVERTED_FORMATS+=("otf")
+              # Update CSS to include OTF
+              sed -i '$ s/;/,'/"$OUTPUT_DIR/${FONT_NAME}.css"
+              echo "    url('./${FONT_NAME}.otf') format('opentype');" >> "$OUTPUT_DIR/${FONT_NAME}.css"
+            fi
+            
+            # Fix CSS - remove trailing comma from last entry
+            sed -i '$ s/,$/;/' "$OUTPUT_DIR/${FONT_NAME}.css"
+            
+            # Complete CSS file
+            cat << EOF >> "$OUTPUT_DIR/${FONT_NAME}.css"
+}
 
-/* Utility classes */
-.{font_name} {{
-  font-family: '{font_name}', sans-serif;
-}}
+/* Usage classes */
+.${FONT_NAME}-text {
+  font-family: '$FONT_NAME', sans-serif;
+}
 
-.{font_name}-bold {{
-  font-family: '{font_name}', sans-serif;
+.${FONT_NAME}-bold {
+  font-family: '$FONT_NAME', sans-serif;
   font-weight: bold;
-}}
+}
 
-.{font_name}-italic {{
-  font-family: '{font_name}', sans-serif;
+.${FONT_NAME}-italic {
+  font-family: '$FONT_NAME', sans-serif;
   font-style: italic;
-}}
-"""
-                    css_path = Path(OUTPUT_DIR) / f"{font_name}.css"
-                    css_path.write_text(css_content)
-                    print(f"  ✓ CSS generated")
-                
-                font_info["converted_formats"] = converted_formats
-                metadata["fonts"].append(font_info)
-                
-                if converted_formats:
-                    conversion_stats["success"] += 1
-                    for fmt in converted_formats:
-                        conversion_stats["formats"][fmt] = conversion_stats["formats"].get(fmt, 0) + 1
-                    print(f"✓ {font_name}: {', '.join(converted_formats)}\n")
-                else:
-                    conversion_stats["failed"] += 1
-                    print(f"✗ {font_name}: No formats converted\n")
-                    
-            except Exception as e:
-                print(f"✗ Error converting {font_name}: {str(e)}\n")
-                conversion_stats["failed"] += 1
+}
+EOF
+            
+            # Update metadata with converted formats
+            FORMATS_JSON=$(printf '"%s",' "${CONVERTED_FORMATS[@]}" | sed 's/,$//')
+            sed -i "s/\"converted_formats\": \[\]/\"converted_formats\": \[$FORMATS_JSON\]/" $OUTPUT_DIR/metadata.json
+            
+            echo "✓ Successfully converted $FONT_NAME to: ${CONVERTED_FORMATS[*]}"
+          fi
+        done
         
-        # Save metadata
-        metadata_path = Path(OUTPUT_DIR) / "metadata.json"
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f, indent=2)
-        
-        # Save stats for summary
-        with open("conversion_stats.json", "w") as f:
-            json.dump(conversion_stats, f)
-        
-        print(f"\n{'='*50}")
-        print(f"Conversion Summary:")
-        print(f"  Successful: {conversion_stats['success']}")
-        print(f"  Failed: {conversion_stats['failed']}")
-        print(f"  Formats generated: {conversion_stats['formats']}")
-        print(f"{'='*50}")
-        PYTHON_SCRIPT
+        # Close metadata array
+        echo "  ]" >> $OUTPUT_DIR/metadata.json
+        echo "}" >> $OUTPUT_DIR/metadata.json
 
     - name: List converted files
       run: |
         echo "📁 Converted files in $OUTPUT_DIR:"
-        if [ -d "$OUTPUT_DIR" ]; then
-          find $OUTPUT_DIR -type f \( -name "*.css" -o -name "*.woff2" -o -name "*.woff" -o -name "*.ttf" -o -name "*.otf" -o -name "*.json" \) | sort
-          echo ""
-          echo "📊 File sizes:"
-          find $OUTPUT_DIR -type f -exec du -h {} \; | sort -h
-        else
-          echo "No output directory found"
-        fi
+        find $OUTPUT_DIR -type f -name "*.css" -o -name "*.woff2" -o -name "*.woff" -o -name "*.ttf" -o -name "*.otf" | sort
+        echo ""
+        echo "📊 File sizes:"
+        find $OUTPUT_DIR -type f -exec du -h {} \; | sort -h
 
     - name: Upload fonts as artifact
-      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: ${{ env.ARTIFACT_NAME }}-${{ github.run_id }}
         path: ${{ env.OUTPUT_DIR }}/
         retention-days: 30
-        if-no-files-found: warn
 
     - name: Generate summary
-      if: always()
       run: |
         echo "## 🎨 Font Conversion Complete" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
-        
-        # Display stats
-        if [ -f "conversion_stats.json" ]; then
-          SUCCESS=$(python -c "import json; print(json.load(open('conversion_stats.json')).get('success', 0))")
-          FAILED=$(python -c "import json; print(json.load(open('conversion_stats.json')).get('failed', 0))")
-          
-          echo "### 📊 Conversion Statistics" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Successful: **$SUCCESS**" >> $GITHUB_STEP_SUMMARY
-          echo "- ❌ Failed: **$FAILED**" >> $GITHUB_STEP_SUMMARY
-          
-          # Show formats count
-          FORMATS_JSON=$(python -c "import json; print(json.dumps(json.load(open('conversion_stats.json')).get('formats', {})))")
-          echo "- 📁 Formats generated:" >> $GITHUB_STEP_SUMMARY
-          python -c "
-import json
-formats = json.loads('$FORMATS_JSON')
-for fmt, count in formats.items():
-    print(f'  - **{fmt.upper()}**: {count} file(s)')
-" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "### ⚠ No Conversion Statistics Available" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-        fi
-        
         echo "### 📥 Input Sources" >> $GITHUB_STEP_SUMMARY
         if [ "${{ github.event.inputs.font_url }}" != "" ]; then
           echo "- **URL Import:** \`${{ github.event.inputs.font_url }}\`" >> $GITHUB_STEP_SUMMARY
         fi
         if [ "${{ steps.find-local-fonts.outputs.font_count }}" != "0" ]; then
-          echo "- **Local Files:** ${{ steps.find-local-fonts.outputs.font_count }} files" >> $GITHUB_STEP_SUMMARY
-        fi
-        if [ "${{ github.event.inputs.font_url }}" == "" ] && [ "${{ steps.find-local-fonts.outputs.font_count }}" == "0" ]; then
-          echo "- **No input sources specified**" >> $GITHUB_STEP_SUMMARY
+          echo "- **Local Files:** ${{ steps.find-local-fonts.outputs.font_count }} files found" >> $GITHUB_STEP_SUMMARY
         fi
         echo "" >> $GITHUB_STEP_SUMMARY
         
-        echo "### 📦 Download Artifact" >> $GITHUB_STEP_SUMMARY
-        echo "**Artifact:** \`${{ env.ARTIFACT_NAME }}-${{ github.run_id }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "### 📁 Artifact Download" >> $GITHUB_STEP_SUMMARY
+        echo "Download the converted fonts from the **Artifacts** section." >> $GITHUB_STEP_SUMMARY
+        echo "**Artifact Name:** \`${{ env.ARTIFACT_NAME }}-${{ github.run_id }}\`" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         
+        # List all converted files
         if [ -d "$OUTPUT_DIR" ]; then
           echo "### 📄 Converted Files" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
+          # Group by font name
           for css_file in $OUTPUT_DIR/*.css; do
             if [ -f "$css_file" ]; then
               FONT_NAME=$(basename "$css_file" .css)
-              echo "#### 🔤 $FONT_NAME" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "#### 🆎 $FONT_NAME" >> $GITHUB_STEP_SUMMARY
               
+              # List all formats for this font
               for format in woff2 woff ttf otf; do
                 if [ -f "$OUTPUT_DIR/${FONT_NAME}.$format" ]; then
                   SIZE=$(du -h "$OUTPUT_DIR/${FONT_NAME}.$format" | cut -f1)
-                  echo "- \`${FONT_NAME}.$format\` - $SIZE" >> $GITHUB_STEP_SUMMARY
+                  echo "- \`${FONT_NAME}.$format\` ($SIZE)" >> $GITHUB_STEP_SUMMARY
                 fi
               done
-              echo "- \`${FONT_NAME}.css\` - CSS stylesheet" >> $GITHUB_STEP_SUMMARY
+              echo "- \`${FONT_NAME}.css\` (CSS import file)" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
             fi
           done
-          
-          # Check for metadata
-          if [ -f "$OUTPUT_DIR/metadata.json" ]; then
-            echo "### 🔍 Metadata" >> $GITHUB_STEP_SUMMARY
-            echo "- \`metadata.json\` - Conversion details and font information" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-          fi
-        else
-          echo "### ❌ No Output Generated" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
         fi
         
-        echo "### 🚀 Usage" >> $GITHUB_STEP_SUMMARY
+        echo "### 🚀 Usage Example" >> $GITHUB_STEP_SUMMARY
         echo '```html' >> $GITHUB_STEP_SUMMARY
-        echo '<!-- Include the CSS file -->' >> $GITHUB_STEP_SUMMARY
-        echo '<link rel="stylesheet" href="path/to/font-name.css">' >> $GITHUB_STEP_SUMMARY
-        echo '' >> $GITHUB_STEP_SUMMARY
-        echo '<!-- Use the font in your HTML -->' >> $GITHUB_STEP_SUMMARY
-        echo '<p class="font-name">Your text here</p>' >> $GITHUB_STEP_SUMMARY
+        echo '<link rel="stylesheet" href="fonts-output/your-font-name.css">' >> $GITHUB_STEP_SUMMARY
+        echo '<div class="your-font-name-text">Hello World with converted font!</div>' >> $GITHUB_STEP_SUMMARY
         echo '```' >> $GITHUB_STEP_SUMMARY
