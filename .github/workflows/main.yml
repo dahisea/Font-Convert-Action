@@ -1,0 +1,94 @@
+name: Font Conversion with OTF Support
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'fonts/**'
+      - '.github/workflows/font-convert.yml'
+  workflow_dispatch:
+    inputs:
+      font_url:
+        description: 'Font URL to download and convert'
+        required: false
+      font_path:
+        description: 'Local font file path'
+        required: false
+        default: 'fonts/input/'
+      output_formats:
+        description: 'Output formats'
+        required: true
+        default: 'woff2,woff,ttf'
+        type: choice
+        options:
+        - woff2,woff,ttf
+        - woff2,woff
+        - woff2,ttf
+        - woff2
+        - all
+
+env:
+  OUTPUT_DIR: fonts-output
+  ARTIFACT_NAME: converted-fonts
+
+jobs:
+  convert-fonts:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup environment
+      uses: ./.github/actions/setup-font-tools
+
+    - name: Create output directory
+      run: mkdir -p $OUTPUT_DIR
+
+    - name: Download font from URL
+      if: github.event.inputs.font_url != ''
+      id: download-font
+      uses: ./.github/actions/download-font
+      with:
+        font_url: ${{ github.event.inputs.font_url }}
+        output_dir: ${{ env.OUTPUT_DIR }}
+
+    - name: Find local font files
+      if: github.event.inputs.font_url == '' || github.event.inputs.font_path != 'fonts/input/'
+      id: find-local-fonts
+      uses: ./.github/actions/find-fonts
+      with:
+        font_path: ${{ github.event.inputs.font_path }}
+        output_dir: ${{ env.OUTPUT_DIR }}
+
+    - name: Convert fonts
+      id: convert-fonts
+      uses: ./.github/actions/convert-fonts
+      with:
+        downloaded_font_path: ${{ steps.download-font.outputs.downloaded_font_path }}
+        font_list_file: font_list.txt
+        output_dir: ${{ env.OUTPUT_DIR }}
+        output_formats: ${{ github.event.inputs.output_formats }}
+
+    - name: List converted files
+      run: |
+        echo "📁 Converted files in $OUTPUT_DIR:"
+        find $OUTPUT_DIR -type f \( -name "*.css" -o -name "*.woff2" -o -name "*.woff" -o -name "*.ttf" -o -name "*.otf" \) | sort
+        echo ""
+        echo "📊 File sizes:"
+        find $OUTPUT_DIR -type f -exec du -h {} \; | sort -h
+
+    - name: Upload fonts as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.ARTIFACT_NAME }}-${{ github.run_id }}
+        path: ${{ env.OUTPUT_DIR }}/
+        retention-days: 30
+
+    - name: Generate summary
+      uses: ./.github/actions/generate-summary
+      with:
+        font_url: ${{ github.event.inputs.font_url }}
+        font_count: ${{ steps.find-local-fonts.outputs.font_count }}
+        output_dir: ${{ env.OUTPUT_DIR }}
+        artifact_name: ${{ env.ARTIFACT_NAME }}-${{ github.run_id }}
